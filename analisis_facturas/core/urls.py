@@ -19,4 +19,5 @@ from django.urls import path, include
 
 urlpatterns = [
     path('facturas/', include('facturas.urls')),
+    path('areasContables/', include('areasContables.urls')),
 ]

@@ -11,6 +11,6 @@ urlpatterns = [
     path('detalle/<str:factura_id_unico>/', FacturaDetalleView.as_view()),
     path('factura_json/', RecibirFacturaJSONView.as_view()),
     path('estado_resultados/', CalcularEstadoResultadosView.as_view()),
-    path('estado_resultados2/', EstadoResultadoListView.as_view(), name='listar_estados'),
+    path('view/estado_resultados/', EstadoResultadoListView.as_view(), name='listar_estados'),
     path('estado_resultados/<str:id_unico>/', EstadoResultadoDetailView.as_view(), name='detalle_estado'),
 ]
