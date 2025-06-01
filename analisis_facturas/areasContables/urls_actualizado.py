@@ -1,7 +1,13 @@
 from django.urls import path
 
-from .views.sumViews import SumatoriasBOEView, TotalActivoView, TotalPasivoYPatrimonioView, EstadoResultadosView, \
-    EstadoResultadosCorregidoView
+from .views.sumViews import (
+    SumatoriasBOEView, 
+    TotalActivoView, 
+    TotalPasivoYPatrimonioView, 
+    EstadoResultadosView,
+    EstadoResultadosCorregidoView,  # NUEVA
+    ResumenResultadosView           # NUEVA
+)
 from .views.views import FacturaUploadView, ResumenMensualView, LineasFacturaListView, AnalisisDuplicadosView
 
 urlpatterns = [
@@ -19,8 +25,7 @@ urlpatterns = [
 
     path('total-patrimonio-pasivo/', TotalPasivoYPatrimonioView.as_view(), name='total-pasivo'),
 
+    # VISTA ORIGINAL
     path("estado-resultados/", EstadoResultadosView.as_view(), name="estado-resultados"),
-    # NUEVAS VISTAS PARA PROBAR
-    path("estado-resultados-corregido/", EstadoResultadosCorregidoView.as_view(), name="estado-resultados-corregido"),
-
-]
+    
+ ]

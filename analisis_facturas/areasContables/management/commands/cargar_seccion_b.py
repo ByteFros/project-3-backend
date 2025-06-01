@@ -40,6 +40,7 @@ class Command(BaseCommand):
                 ("Instrumentos de patrimonio", "5303,5304", "5393,5394,593"),
                 ("Créditos a empresas", "5323,5324,5343,5344", "5953,5954"),
                 ("Valores representativos de deuda", "5313,5314,5333,5334", "5943,5944"),
+                ("Derivados", "", ""),
                 ("Otros activos financieros", "5353,5354,5523,5524", ""),
             ]),
 

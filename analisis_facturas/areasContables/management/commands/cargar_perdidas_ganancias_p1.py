@@ -39,7 +39,7 @@ class Command(BaseCommand):
             ]),
             ("Otros gastos de explotación", "GEXP", "7. Otros gastos de explotación", [
                 ("a) Servicios exteriores", "", "62"),
-                ("b) Tributos", "631,634,636,639", ""),
+                ("b) Tributos", "636,639", "631,634"),
                 ("c) Provisiones comerciales", "794,7954", "650,694,695"),
                 ("d) Otros gastos de gestión corriente", "", "651,659"),
             ]),

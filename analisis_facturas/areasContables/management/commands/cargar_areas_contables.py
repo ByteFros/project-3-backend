@@ -34,6 +34,7 @@ class Command(BaseCommand):
                 ("Instrumentos de patrimonio", "2403,2404", "2493,2494,293"),
                 ("Créditos a empresas", "2423,2424", "2953,2954"),
                 ("Valores representativos de deuda", "2413,2414", "2943,2944"),
+                ("Derivados", "", ""),
                 ("Otros activos financieros", "", ""),
             ]),
             ("A", "Inversiones financieras a largo plazo", "INVFIN", "Activos financieros con terceros", [
