@@ -2,7 +2,7 @@ from django.urls import path
 
 from .views.sumViews import SumatoriasBOEView, TotalActivoView, TotalPasivoYPatrimonioView, \
     EstadoResultadosCorregidoView, IngresosGastosReconocidosView
-from .views.views import FacturaUploadView, ResumenMensualView, LineasFacturaListView, AnalisisDuplicadosView, \
+from .views.views import FacturaUploadView, ResumenMensualView, AnalisisDuplicadosView, \
     LineasFacturaSampleListView
 
 urlpatterns = [
@@ -25,3 +25,4 @@ urlpatterns = [
          name='ingresos_gastos_reconocidos'),
 
 ]
+"""TODO  hay que ajustar la carga y si es posible migrar la informacion a postgres, ademas ajustar la carga de scripts con datos para que funcione la base de datos"""

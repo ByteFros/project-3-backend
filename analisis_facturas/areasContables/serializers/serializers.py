@@ -22,3 +22,17 @@ class LineaFacturaSerializer(serializers.ModelSerializer):
 
     def get_area(self, obj):
         return obj.subarea.area.nombre if obj.subarea and obj.subarea.area else None
+
+class LineaFacturaSimpleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LineaFactura
+        fields = [
+            "id",
+            "fecha",
+            "asiento",
+            "cuenta",
+            "nombre",
+            "concepto",
+            "debe",
+            "haber",
+        ]

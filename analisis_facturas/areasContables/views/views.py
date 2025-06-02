@@ -1,5 +1,8 @@
+from rest_framework.generics import ListAPIView
+from rest_framework.pagination import PageNumberPagination
+
 from ..models import LineaFactura
-from ..serializers.serializers import LineaFacturaSerializer
+from ..serializers.serializers import LineaFacturaSerializer, LineaFacturaSimpleSerializer
 from ..utils.utils import buscar_subarea_por_cuenta
 import pandas as pd
 from datetime import datetime, timedelta
@@ -723,9 +726,11 @@ class LineasFacturaListView(APIView):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class LineasFacturaSampleListView(APIView):
-    def get(self, request, *args, **kwargs):
-        lineas = LineaFactura.objects.all().order_by("fecha", "asiento")
+class LineaFacturaPagination(PageNumberPagination):
+    page_size = 100
 
-        serializer = LineaFacturaSerializer(lineas, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+
+class LineasFacturaSampleListView(ListAPIView):
+    queryset = LineaFactura.objects.all().order_by("fecha", "asiento")
+    serializer_class = LineaFacturaSimpleSerializer
+    pagination_class = LineaFacturaPagination
