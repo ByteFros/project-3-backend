@@ -3,136 +3,28 @@ from rest_framework.pagination import PageNumberPagination
 
 from ..models import LineaFactura
 from ..serializers.serializers import LineaFacturaSerializer, LineaFacturaSimpleSerializer
-from ..utils.utils import buscar_subarea_por_cuenta
 import pandas as pd
-from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from collections import defaultdict
 from rest_framework.views import APIView
 from rest_framework.parsers import MultiPartParser
 from rest_framework.response import Response
 from rest_framework import status
+from areasContables.utils.mapeo_cuentas import (
+    mapear_columnas_excel,
+    procesar_fila_excel,
+    analizar_mapeo_cuentas_completo,
+    normalizar_codigo_cuenta,
+    parse_fecha_mejorada,
+    parse_decimal_mejorado
+)
 
 
 class FacturaUploadView(APIView):
     parser_classes = [MultiPartParser]
 
-    def _parse_fecha(self, fecha_valor):
-        """
-        Parsea fechas en múltiples formatos de manera más robusta
-        """
-        if not fecha_valor or (isinstance(fecha_valor, str) and fecha_valor.strip() == ""):
-            return None
-
-        try:
-            # Si pandas ya lo convirtió a datetime
-            if hasattr(fecha_valor, 'date'):
-                return fecha_valor.date()
-
-            # Si es un objeto datetime de pandas (Timestamp)
-            if str(type(fecha_valor)) == "<class 'pandas._libs.tslibs.timestamps.Timestamp'>":
-                return fecha_valor.date()
-
-            # Si es número (serial de Excel/ODS)
-            if isinstance(fecha_valor, (int, float)):
-                # Verificar que sea un número razonable para una fecha
-                if 1 <= fecha_valor <= 100000:  # Rango razonable para fechas Excel
-                    excel_epoch = datetime(1900, 1, 1)
-                    days = int(fecha_valor) - 2  # -2 por el bug histórico de Excel
-                    fecha_calculada = excel_epoch + timedelta(days=days)
-                    return fecha_calculada.date()
-
-            # Convertir a string y limpiar
-            fecha_str = str(fecha_valor).strip()
-
-            # Manejar valores vacíos o nulos
-            if fecha_str.lower() in ['nan', 'nat', 'none', '', 'null']:
-                return None
-
-            # Lista de formatos a probar en orden
-            formatos_fecha = [
-                # Formatos con tiempo (más específicos primero)
-                "%Y-%m-%d %H:%M:%S",  # 2024-12-31 00:00:00
-                "%d/%m/%Y %H:%M:%S",  # 31/12/2024 00:00:00
-                "%Y-%m-%dT%H:%M:%S",  # 2024-12-31T00:00:00
-
-                # Formatos solo fecha
-                "%d/%m/%Y",  # 31/12/2024 (formato español)
-                "%Y-%m-%d",  # 2024-12-31 (formato ISO)
-                "%m/%d/%Y",  # 12/31/2024 (formato americano)
-                "%d-%m-%Y",  # 31-12-2024
-                "%Y/%m/%d",  # 2024/12/31
-
-                # Formatos con año corto
-                "%d/%m/%y",  # 31/12/24
-                "%d-%m-%y",  # 31-12-24
-                "%y/%m/%d",  # 24/12/31
-
-                # Otros formatos
-                "%d.%m.%Y",  # 31.12.2024
-                "%d %m %Y",  # 31 12 2024
-                "%Y%m%d",  # 20241231
-                "%d-%b-%Y",  # 31-Dec-2024
-                "%d %b %Y",  # 31 Dec 2024
-            ]
-
-            # Intentar cada formato
-            for formato in formatos_fecha:
-                try:
-                    fecha_parseada = datetime.strptime(fecha_str, formato)
-                    return fecha_parseada.date()
-                except ValueError:
-                    # ⚠️ Si el formato tiene tiempo, intenta truncar a solo fecha
-                    if " " in fecha_str:
-                        try:
-                            fecha_solo_fecha = fecha_str.split(" ")[0]
-                            fecha_parseada = datetime.strptime(fecha_solo_fecha, "%Y-%m-%d")
-                            return fecha_parseada.date()
-                        except:
-                            pass
-
-            # Si es string numérico, intentar como serial de Excel
-            try:
-                numero_serial = float(fecha_str)
-                if 1 <= numero_serial <= 100000:  # Rango razonable
-                    excel_epoch = datetime(1900, 1, 1)
-                    days = int(numero_serial) - 2
-                    fecha_calculada = excel_epoch + timedelta(days=days)
-                    return fecha_calculada.date()
-            except ValueError:
-                pass
-
-            # Último intento: usar dateutil.parser si está disponible
-            try:
-                from dateutil import parser
-                fecha_parseada = parser.parse(fecha_str, dayfirst=True)  # Día primero (formato español)
-                return fecha_parseada.date()
-            except Exception as e:
-                print(f"📛 dateutil no pudo parsear: {fecha_str} → {e}")
-
-        except Exception as e:
-            print(f"❌ Error inesperado al parsear fecha '{fecha_valor}': {e}")
-
-        print(f"⚠️  No se pudo parsear la fecha '{fecha_valor}' (tipo: {type(fecha_valor)})")
-        return None
-
-    def _parse_decimal(self, valor):
-        """
-        Convierte valores a Decimal manejando diferentes formatos
-        """
-        try:
-            if not valor:
-                return None
-            if isinstance(valor, (int, float)):
-                return Decimal(str(valor))
-            return Decimal(str(valor).replace(",", "")) if valor else None
-        except (InvalidOperation, ValueError, TypeError):
-            return None
-
     def _detectar_tipo_archivo(self, archivo):
-        """
-        Detecta el tipo de archivo basado en la extensión
-        """
+        """Detecta el tipo de archivo basado en la extensión"""
         nombre = archivo.name.lower()
         if nombre.endswith('.xls'):
             return 'xls'
@@ -146,30 +38,32 @@ class FacturaUploadView(APIView):
     def _detectar_fila_encabezados(self, df):
         """
         Detecta automáticamente en qué fila están los encabezados reales
+        Versión mejorada con más palabras clave
         """
-        encabezados_esperados = ['Fecha', 'Asto', 'Doc', 'Cuenta', 'Nombre', 'Concepto', 'Debe', 'Haber']
+        palabras_clave = [
+            'fecha', 'asiento', 'cuenta', 'debe', 'haber', 'concepto', 'documento',
+            'date', 'account', 'debit', 'credit', 'ref', 'importe', 'descripcion',
+            'asto', 'doc', 'nombre', 'cta'
+        ]
 
         # Buscar en las primeras 10 filas
         for fila_idx in range(min(10, len(df))):
-            fila_valores = [str(val).strip() for val in df.iloc[fila_idx].values if pd.notna(val)]
+            fila_valores = [str(val).strip().lower() for val in df.iloc[fila_idx].values if pd.notna(val)]
 
-            # Contar cuántos encabezados esperados encontramos
-            coincidencias = sum(1 for encabezado in encabezados_esperados
-                                if any(encabezado.lower() in str(val).lower() for val in fila_valores))
+            # Contar cuántas palabras clave encontramos
+            coincidencias = sum(1 for palabra in palabras_clave
+                                if any(palabra in str(val) for val in fila_valores))
 
-            # Si encontramos al menos 4 encabezados esperados, probablemente es la fila correcta
-            if coincidencias >= 4:
-                print(f"🎯 Encabezados detectados en fila {fila_idx + 1}: {fila_valores}")
+            # Si encontramos al menos 3 palabras clave, probablemente es la fila correcta
+            if coincidencias >= 3:
+                print(f"🎯 Encabezados detectados en fila {fila_idx + 1}: {df.iloc[fila_idx].values}")
                 return fila_idx
 
-        # Si no encontramos encabezados, asumir que están en la fila 0
         print("⚠️  No se detectaron encabezados automáticamente, usando fila 1")
         return 0
 
     def _leer_archivo_excel(self, archivo):
-        """
-        Lee archivos Excel (.xls y .xlsx) usando pandas
-        """
+        """Lee archivos Excel (.xls y .xlsx) usando pandas"""
         try:
             # Primero leer sin encabezados para detectar la estructura
             df_temp = pd.read_excel(archivo, header=None,
@@ -183,8 +77,8 @@ class FacturaUploadView(APIView):
                 archivo,
                 header=fila_encabezados,
                 engine='openpyxl' if archivo.name.endswith('.xlsx') else 'xlrd',
-                date_parser=None,  # No parsear fechas automáticamente
-                keep_default_na=False,  # Mantener valores como están
+                date_parser=None,
+                keep_default_na=False,
             )
 
             # Limpiar nombres de columnas
@@ -194,7 +88,7 @@ class FacturaUploadView(APIView):
             # Eliminar filas completamente vacías
             df = df.dropna(how='all')
 
-            # Convertir DataFrame a formato similar al original
+            # Convertir DataFrame a formato de diccionarios
             encabezados = df.columns.tolist()
             filas = []
 
@@ -202,7 +96,8 @@ class FacturaUploadView(APIView):
                 valores = [str(val).strip() if pd.notna(val) else "" for val in row.values]
                 # Solo incluir filas que tengan al menos una celda con contenido
                 if any(val.strip() for val in valores):
-                    filas.append(valores)
+                    fila_dict = dict(zip(encabezados, valores))
+                    filas.append(fila_dict)
 
             return encabezados, filas
 
@@ -210,9 +105,7 @@ class FacturaUploadView(APIView):
             raise Exception(f"Error al leer archivo Excel: {str(e)}")
 
     def _leer_archivo_ods(self, archivo):
-        """
-        Lee archivos ODS usando la librería original
-        """
+        """Lee archivos ODS usando la librería original"""
         try:
             from odf.opendocument import load
             from odf.table import Table, TableRow, TableCell
@@ -238,7 +131,9 @@ class FacturaUploadView(APIView):
                 if i == 0:
                     encabezados = valores
                 else:
-                    filas.append(valores)
+                    if any(val.strip() for val in valores):  # Solo filas con contenido
+                        fila_dict = dict(zip(encabezados, valores))
+                        filas.append(fila_dict)
 
             return encabezados, filas
 
@@ -266,326 +161,208 @@ class FacturaUploadView(APIView):
                 }, status=400)
 
             print(f"📋 Encabezados encontrados: {encabezados}")
+
+            # *** USAR NUEVO SISTEMA DE MAPEO CONSOLIDADO ***
+            mapeo_columnas = mapear_columnas_excel(encabezados)
+            print(f"🗺️  Mapeo de columnas detectado:")
+            for campo, info in mapeo_columnas.items():
+                print(f"  {campo} → '{info['nombre_original']}' (score: {info['score']})")
+
+            # Verificar que tenemos los campos esenciales
+            campos_esenciales = ['cuenta']
+            campos_faltantes = [c for c in campos_esenciales if c not in mapeo_columnas]
+
+            if campos_faltantes:
+                return Response({
+                    "error": f"No se encontraron columnas para los campos esenciales: {campos_faltantes}",
+                    "encabezados_disponibles": encabezados,
+                    "mapeo_detectado": mapeo_columnas
+                }, status=400)
+
             print(f"📊 Total de filas de datos: {len(filas_datos)}")
 
-            # Variables de control
-            lineas_creadas = 0
-            lineas_omitidas = 0
-            lineas_no_clasificadas = 0
-            errores_fecha = 0
+            # Variables de control mejoradas
+            estadisticas = {
+                'lineas_creadas': 0,
+                'lineas_omitidas': 0,
+                'errores_fecha': 0,
+                'lineas_sin_valores': 0,
+                'lineas_sin_subarea': 0,
+                'lineas_procesadas_ok': 0
+            }
 
-            # NUEVAS VARIABLES PARA VALIDACIÓN COMPLETA
-            cuentas_no_clasificadas = set()
-            lineas_sin_debe_haber = []
-            lineas_formato_incorrecto = []
+            # Variables para análisis detallado
             lineas_problematicas = []
-
-            # Variables para verificación
-            lineas_procesadas_detalle = []
-            total_filas_archivo = len(filas_datos)
-
+            cuentas_procesadas = []
             sumatorias_por_subarea = defaultdict(lambda: {"debe": Decimal(0), "haber": Decimal(0)})
             sumatorias_por_area = defaultdict(lambda: {"debe": Decimal(0), "haber": Decimal(0)})
 
-            # Procesar cada fila
-            for i, valores in enumerate(filas_datos, start=1):
-                fila_dict = dict(zip(encabezados, valores))
-
-                # Verificar que tenga cuenta (requisito mínimo)
-                # Buscar el campo "Cuenta" de manera flexible
-                cuenta = ""
-                for campo in ["Cuenta", "cuenta", "CUENTA", "Cta"]:
-                    if campo in fila_dict:
-                        cuenta = str(fila_dict[campo]).strip()
-                        break
-
-                # Si no tiene cuenta o es una fila de encabezado/título, omitir
-                if not cuenta or cuenta in ["Cuenta", "cuenta", "CUENTA", ""]:
-                    if i <= 10:  # Solo mostrar las primeras 10 omisiones para no saturar el log
-                        print(f"⚠️  Fila {i + 1}: Omitida por no tener cuenta válida (valor: '{cuenta}')")
-                    continue
-
-                # Parsear fecha - buscar campo fecha de manera flexible
-                fecha_valor = ""
-                for campo in ["Fecha", "fecha", "FECHA", "Date"]:
-                    if campo in fila_dict:
-                        fecha_valor = fila_dict[campo]
-                        break
-
-                fecha_formateada = self._parse_fecha(fecha_valor)
-
-                # Debug mejorado para fechas - mostrar más ejemplos
-                if fecha_valor and not fecha_formateada:
-                    errores_fecha += 1
-                    if errores_fecha <= 10:  # Mostrar los primeros 10 errores
-                        print(
-                            f"❌ FECHA ERROR #{errores_fecha} - Fila {i + 1}: '{fecha_valor}' (tipo: {type(fecha_valor)})")
-                elif fecha_valor and fecha_formateada:
-                    if i <= 10:  # Mostrar los primeros 10 éxitos para verificar
-                        print(f"✅ FECHA OK - Fila {i + 1}: '{fecha_valor}' → {fecha_formateada}")
-                elif not fecha_valor:
-                    if i <= 3:  # Solo mostrar las primeras para no saturar
-                        print(f"⚪ FECHA VACÍA - Fila {i + 1}: Campo fecha está vacío")
-
-                # Parsear valores monetarios - buscar campos de manera flexible
-                debe_original = ""
-                haber_original = ""
-                concepto = ""
-
-                for campo in ["Debe", "debe", "DEBE", "Debit"]:
-                    if campo in fila_dict:
-                        debe_original = str(fila_dict[campo]).strip()
-                        break
-
-                for campo in ["Haber", "haber", "HABER", "Credit"]:
-                    if campo in fila_dict:
-                        haber_original = str(fila_dict[campo]).strip()
-                        break
-
-                for campo in ["Concepto", "concepto", "CONCEPTO", "Descripcion", "Description"]:
-                    if campo in fila_dict:
-                        concepto = str(fila_dict[campo]).strip()
-                        break
-
-                debe = self._parse_decimal(debe_original)
-                haber = self._parse_decimal(haber_original)
-
-                # *** VALIDACIONES COMPLETAS ***
-                problemas_fila = []
-
-                # 1. VALIDAR QUE TENGA VALORES DEBE O HABER
-                if not debe and not haber:
-                    # Verificar si hay valor en concepto (formato incorrecto)
-                    valor_en_concepto = self._parse_decimal(concepto)
-                    if valor_en_concepto:
-                        problema = {
-                            "tipo": "formato_incorrecto",
-                            "descripcion": f"Valor {valor_en_concepto} encontrado en 'Concepto' en lugar de 'Debe/Haber'",
-                            "valor_detectado": float(valor_en_concepto),
-                            "campo_origen": "Concepto",
-                            "solucion": "Mover el valor al campo 'Debe' o 'Haber' correspondiente"
-                        }
-                        problemas_fila.append(problema)
-                        lineas_formato_incorrecto.append({
-                            "fila": i + 1,
-                            "cuenta": cuenta,
-                            "nombre": fila_dict.get("Nombre", ""),
-                            "concepto_original": concepto,
-                            "valor_detectado": float(valor_en_concepto),
-                            "problema": "Valor monetario en campo 'Concepto'"
-                        })
-                        print(
-                            f"🔴 FORMATO INCORRECTO - Fila {i + 1}: Valor {valor_en_concepto} en 'Concepto' (Cuenta: {cuenta})")
-                    else:
-                        problema = {
-                            "tipo": "sin_valores_monetarios",
-                            "descripcion": "Línea sin valores en 'Debe' ni 'Haber'",
-                            "debe_original": debe_original,
-                            "haber_original": haber_original,
-                            "solucion": "Verificar si esta línea debe tener valores monetarios"
-                        }
-                        problemas_fila.append(problema)
-                        lineas_sin_debe_haber.append({
-                            "fila": i + 1,
-                            "cuenta": cuenta,
-                            "nombre": fila_dict.get("Nombre", ""),
-                            "concepto": concepto,
-                            "debe_original": debe_original,
-                            "haber_original": haber_original,
-                            "problema": "Sin valores monetarios en Debe ni Haber"
-                        })
-                        print(f"🔴 SIN VALORES - Fila {i + 1}: No tiene valores en Debe ni Haber (Cuenta: {cuenta})")
-
-                # 2. VALIDAR CLASIFICACIÓN POR ÁREA/SUBÁREA
-                subarea = buscar_subarea_por_cuenta(cuenta)  # Esta función debe estar definida en tu código
-                if not subarea:
-                    lineas_no_clasificadas += 1
-                    cuentas_no_clasificadas.add(cuenta)
-                    problema = {
-                        "tipo": "cuenta_no_clasificada",
-                        "descripcion": f"La cuenta '{cuenta}' no está asignada a ningún área/subárea",
-                        "solucion": "Añadir esta cuenta al sistema de clasificación de áreas"
-                    }
-                    problemas_fila.append(problema)
-                    print(
-                        f"🔴 NO CLASIFICADA - Fila {i + 1}: Cuenta '{cuenta}' ({fila_dict.get('Nombre', 'Sin nombre')})")
-
-                # Guardar líneas problemáticas para reporte
-                if problemas_fila:
-                    lineas_problematicas.append({
-                        "fila": i + 1,
-                        "cuenta": cuenta,
-                        "nombre": fila_dict.get("Nombre", ""),
-                        "concepto": concepto,
-                        "debe": debe_original,
-                        "haber": haber_original,
-                        "problemas": problemas_fila
-                    })
-
-                # *** CREAR LÍNEAS EN BASE DE DATOS ***
+            # *** PROCESAR CADA FILA CON SISTEMA CONSOLIDADO ***
+            for i, fila_dict in enumerate(filas_datos, start=1):
                 try:
-                    # Buscar otros campos de manera flexible
-                    asiento = ""
-                    nombre = ""
+                    # Usar función consolidada para procesar la fila
+                    resultado_fila = procesar_fila_excel(fila_dict, mapeo_columnas)
+                    datos = resultado_fila['datos_procesados']
+                    validaciones = resultado_fila['validaciones']
 
-                    for campo in ["Asto", "asto", "ASTO", "Asiento", "asiento"]:
-                        if campo in fila_dict:
-                            asiento = str(fila_dict[campo]).strip()
-                            break
+                    # Verificar validaciones básicas
+                    if not datos['cuenta_normalizada']:
+                        if i <= 10:  # Solo log las primeras 10
+                            print(f"⚠️  Fila {i}: Omitida por no tener cuenta válida")
+                        estadisticas['lineas_omitidas'] += 1
+                        continue
 
-                    for campo in ["Nombre", "nombre", "NOMBRE", "Name", "Descripcion"]:
-                        if campo in fila_dict:
-                            nombre = str(fila_dict[campo]).strip()
-                            break
+                    # Recopilar estadísticas de problemas
+                    if 'fecha_invalida' in validaciones['problemas']:
+                        estadisticas['errores_fecha'] += 1
+                    if 'sin_valores_monetarios' in validaciones['problemas']:
+                        estadisticas['lineas_sin_valores'] += 1
+                    if 'sin_subarea' in validaciones['problemas']:
+                        estadisticas['lineas_sin_subarea'] += 1
 
-                    linea_creada = LineaFactura.objects.create(  # Asegúrate de importar este modelo
-                        subarea=subarea,
-                        fecha=fecha_formateada,
-                        asiento=asiento,
-                        cuenta=cuenta,
-                        nombre=nombre,
-                        concepto=concepto,
-                        debe=debe,
-                        haber=haber,
+                    # Guardar líneas problemáticas para reporte
+                    if not validaciones['es_valida']:
+                        lineas_problematicas.append({
+                            'fila': i,
+                            'cuenta': datos['cuenta'],
+                            'cuenta_normalizada': datos['cuenta_normalizada'],
+                            'nombre': datos['nombre'],
+                            'problemas': validaciones['problemas'],
+                            'tiene_subarea': validaciones['tiene_subarea'],
+                            'tiene_valores': validaciones['tiene_valores']
+                        })
+
+                    # Crear línea en base de datos
+                    linea_creada = LineaFactura.objects.create(
+                        subarea=datos['subarea'],
+                        fecha=datos['fecha'],
+                        asiento=datos['asiento'],
+                        cuenta=datos['cuenta'],
+                        nombre=datos['nombre'],
+                        concepto=datos['concepto'],
+                        debe=datos['debe'],
+                        haber=datos['haber'],
                     )
-                    lineas_creadas += 1
 
-                    # Guardar detalle para verificación
-                    detalle_linea = {
-                        "fila_archivo": i + 1,
-                        "id_bd": linea_creada.id,
-                        "cuenta": cuenta,
-                        "debe": float(debe) if debe else 0.0,
-                        "haber": float(haber) if haber else 0.0,
-                        "tiene_subarea": subarea is not None,
-                        "tiene_problemas": len(problemas_fila) > 0
-                    }
-                    lineas_procesadas_detalle.append(detalle_linea)
+                    estadisticas['lineas_creadas'] += 1
+                    if validaciones['es_valida']:
+                        estadisticas['lineas_procesadas_ok'] += 1
 
-                    # Sumar a totales
-                    if subarea:
-                        sumatorias_por_subarea[subarea.nombre]["debe"] += debe or Decimal(0)
-                        sumatorias_por_subarea[subarea.nombre]["haber"] += haber or Decimal(0)
-                        area_nombre = subarea.area.nombre
-                        sumatorias_por_area[area_nombre]["debe"] += debe or Decimal(0)
-                        sumatorias_por_area[area_nombre]["haber"] += haber or Decimal(0)
+                    # Recopilar para análisis
+                    cuentas_procesadas.append(datos['cuenta'])
+
+                    # Sumar a totales por área/subárea
+                    debe_val = datos['debe'] or Decimal(0)
+                    haber_val = datos['haber'] or Decimal(0)
+
+                    if datos['subarea']:
+                        subarea_nombre = datos['subarea'].nombre
+                        area_nombre = datos['subarea'].area.nombre
+
+                        sumatorias_por_subarea[subarea_nombre]["debe"] += debe_val
+                        sumatorias_por_subarea[subarea_nombre]["haber"] += haber_val
+                        sumatorias_por_area[area_nombre]["debe"] += debe_val
+                        sumatorias_por_area[area_nombre]["haber"] += haber_val
                     else:
-                        sumatorias_por_area["No Clasificadas"]["debe"] += debe or Decimal(0)
-                        sumatorias_por_area["No Clasificadas"]["haber"] += haber or Decimal(0)
+                        sumatorias_por_area["No Clasificadas"]["debe"] += debe_val
+                        sumatorias_por_area["No Clasificadas"]["haber"] += haber_val
 
                 except Exception as e:
-                    print(f"❌ ERROR al crear línea {i + 1} (cuenta {cuenta}): {e}")
-                    lineas_omitidas += 1
+                    print(f"❌ ERROR al procesar fila {i}: {e}")
+                    estadisticas['lineas_omitidas'] += 1
                     continue
+
+            # *** ANÁLISIS COMPLETO DE MAPEO ***
+            analisis_mapeo = analizar_mapeo_cuentas_completo(cuentas_procesadas)
 
             # Calcular totales finales
             total_debe = sum(v["debe"] for v in sumatorias_por_area.values())
             total_haber = sum(v["haber"] for v in sumatorias_por_area.values())
 
-            # Calcular totales de TODAS las líneas procesadas
-            total_debe_todas_lineas = sum(detalle["debe"] for detalle in lineas_procesadas_detalle)
-            total_haber_todas_lineas = sum(detalle["haber"] for detalle in lineas_procesadas_detalle)
+            # Generar mensaje informativo
+            mensaje_base = f"{estadisticas['lineas_creadas']} líneas procesadas de {len(filas_datos)} filas del archivo {tipo_archivo.upper()}."
 
-            # Mensaje informativo
-            mensaje = f"{lineas_creadas} líneas procesadas de {total_filas_archivo} filas del archivo {tipo_archivo.upper()}."
-
-            # Añadir advertencias al mensaje
+            # Añadir advertencias si existen problemas
             advertencias = []
-            if len(lineas_sin_debe_haber) > 0:
-                advertencias.append(f"{len(lineas_sin_debe_haber)} líneas sin valores monetarios")
-            if len(lineas_formato_incorrecto) > 0:
-                advertencias.append(f"{len(lineas_formato_incorrecto)} líneas con formato incorrecto")
-            if lineas_no_clasificadas > 0:
-                advertencias.append(f"{lineas_no_clasificadas} líneas sin clasificar")
-            if errores_fecha > 0:
-                advertencias.append(f"{errores_fecha} errores de fecha")
+            if estadisticas['lineas_sin_valores'] > 0:
+                advertencias.append(f"{estadisticas['lineas_sin_valores']} sin valores monetarios")
+            if estadisticas['lineas_sin_subarea'] > 0:
+                advertencias.append(f"{estadisticas['lineas_sin_subarea']} sin clasificar")
+            if estadisticas['errores_fecha'] > 0:
+                advertencias.append(f"{estadisticas['errores_fecha']} errores de fecha")
 
+            mensaje_final = mensaje_base
             if advertencias:
-                mensaje += f" ADVERTENCIAS: {', '.join(advertencias)}."
+                mensaje_final += f" ADVERTENCIAS: {', '.join(advertencias)}."
 
-            # Verificación final
-            diferencia_debe = 5823021.30 - total_debe_todas_lineas
-            diferencia_haber = 5823021.30 - total_haber_todas_lineas
+            # Información de calidad del procesamiento
+            porcentaje_exito = (estadisticas['lineas_procesadas_ok'] / estadisticas['lineas_creadas'] * 100) if \
+            estadisticas['lineas_creadas'] > 0 else 0
 
             print(f"\n📊 RESUMEN FINAL:")
             print(f"Tipo de archivo: {tipo_archivo.upper()}")
-            print(f"Total líneas procesadas: {len(lineas_procesadas_detalle)}")
-            print(f"Líneas con problemas: {len(lineas_problematicas)}")
-            print(f"Diferencia en Debe: {diferencia_debe:.2f}")
-            print(f"Diferencia en Haber: {diferencia_haber:.2f}")
+            print(f"Líneas creadas: {estadisticas['lineas_creadas']}")
+            print(f"Líneas procesadas OK: {estadisticas['lineas_procesadas_ok']}")
+            print(f"Porcentaje de éxito: {porcentaje_exito:.1f}%")
+            print(f"Cuentas mapeadas: {analisis_mapeo['estadisticas_detalladas']['mapeadas']}")
+            print(f"Cuentas no mapeadas: {analisis_mapeo['estadisticas_detalladas']['no_mapeadas']}")
 
             return Response({
-                "mensaje": mensaje,
+                "mensaje": mensaje_final,
                 "tipo_archivo": tipo_archivo,
 
-                # Estadísticas básicas
+                # Información del mapeo de columnas
+                "mapeo_columnas": {
+                    "detectado": mapeo_columnas,
+                    "encabezados_originales": encabezados,
+                    "campos_mapeados": list(mapeo_columnas.keys()),
+                    "calidad_mapeo": sum(info['score'] for info in mapeo_columnas.values()) / len(
+                        mapeo_columnas) if mapeo_columnas else 0
+                },
+
+                # Estadísticas mejoradas
                 "estadisticas": {
-                    "total_filas_archivo": total_filas_archivo,
-                    "lineas_creadas": lineas_creadas,
-                    "lineas_omitidas": lineas_omitidas,
-                    "lineas_no_clasificadas": lineas_no_clasificadas,
-                    "errores_fecha": errores_fecha
+                    **estadisticas,
+                    "total_filas_archivo": len(filas_datos),
+                    "porcentaje_exito": round(porcentaje_exito, 2),
+                    "porcentaje_mapeo": round(analisis_mapeo['estadisticas_detalladas']['porcentaje_exito'], 2)
+                },
+
+                # Análisis completo de cuentas
+                "analisis_cuentas": {
+                    "resumen": analisis_mapeo['estadisticas_detalladas'],
+                    "cuentas_mapeadas": analisis_mapeo['cuentas_mapeadas'][:20],  # Primeras 20
+                    "cuentas_no_mapeadas": analisis_mapeo['cuentas_no_mapeadas'][:20],  # Primeras 20
+                    "recomendaciones": analisis_mapeo['recomendaciones']
                 },
 
                 # Sumatorias por área/subárea
-                "sumatorias_por_area": sumatorias_por_area,
-                "sumatorias_por_subarea": sumatorias_por_subarea,
+                "sumatorias_por_area": {k: {"debe": float(v["debe"]), "haber": float(v["haber"])}
+                                        for k, v in sumatorias_por_area.items()},
+                "sumatorias_por_subarea": {k: {"debe": float(v["debe"]), "haber": float(v["haber"])}
+                                           for k, v in sumatorias_por_subarea.items()},
 
                 # Totales
-                "totales_clasificados": {
+                "totales": {
                     "debe": float(total_debe),
                     "haber": float(total_haber),
-                    "balanceado": total_debe == total_haber
-                },
-                "totales_todas_lineas": {
-                    "debe": total_debe_todas_lineas,
-                    "haber": total_haber_todas_lineas,
-                    "balanceado": abs(total_debe_todas_lineas - total_haber_todas_lineas) < 0.01
+                    "diferencia": float(total_debe - total_haber),
+                    "balanceado": abs(total_debe - total_haber) < 0.01
                 },
 
-                # Verificación contra archivo original
-                "verificacion_archivo": {
-                    "debe_esperado": 5823021.30,
-                    "haber_esperado": 5823021.30,
-                    "diferencia_debe": diferencia_debe,
-                    "diferencia_haber": diferencia_haber,
-                    "coincide_perfectamente": (
-                            abs(diferencia_debe) < 0.01 and abs(diferencia_haber) < 0.01
-                    )
-                },
-
-                # Reporte completo de problemas
+                # Reporte de problemas (limitado para no saturar)
                 "reporte_problemas": {
-                    "resumen": {
-                        "total_lineas_con_problemas": len(lineas_problematicas),
-                        "lineas_sin_valores_monetarios": len(lineas_sin_debe_haber),
-                        "lineas_formato_incorrecto": len(lineas_formato_incorrecto),
-                        "cuentas_no_clasificadas": len(cuentas_no_clasificadas)
-                    },
-
-                    "lineas_sin_debe_haber": {
-                        "cantidad": len(lineas_sin_debe_haber),
-                        "descripcion": "Líneas que no tienen valores en campos 'Debe' ni 'Haber'",
-                        "accion_requerida": "Verificar si estas líneas deben tener valores monetarios o eliminarlas",
-                        "detalles": lineas_sin_debe_haber
-                    },
-
-                    "lineas_formato_incorrecto": {
-                        "cantidad": len(lineas_formato_incorrecto),
-                        "descripcion": "Líneas con valores monetarios en campos incorrectos",
-                        "accion_requerida": "Mover los valores al campo 'Debe' o 'Haber' correspondiente",
-                        "detalles": lineas_formato_incorrecto
-                    },
-
-                    "cuentas_no_clasificadas": {
-                        "cantidad": len(cuentas_no_clasificadas),
-                        "descripcion": "Cuentas que no están asignadas a ningún área/subárea",
-                        "accion_requerida": "Añadir estas cuentas al sistema de clasificación",
-                        "cuentas": sorted(list(cuentas_no_clasificadas))
-                    },
-
-                    "detalle_completo": lineas_problematicas
+                    "total_lineas_con_problemas": len(lineas_problematicas),
+                    "muestra_problemas": lineas_problematicas[:10],  # Solo primeros 10
+                    "tipos_problemas": {
+                        "fecha_invalida": len([p for p in lineas_problematicas if 'fecha_invalida' in p['problemas']]),
+                        "sin_valores_monetarios": len(
+                            [p for p in lineas_problematicas if 'sin_valores_monetarios' in p['problemas']]),
+                        "sin_subarea": len([p for p in lineas_problematicas if 'sin_subarea' in p['problemas']]),
+                        "cuenta_vacia": len([p for p in lineas_problematicas if 'cuenta_vacia' in p['problemas']])
+                    }
                 }
+
             }, status=status.HTTP_201_CREATED)
 
         except Exception as e:
