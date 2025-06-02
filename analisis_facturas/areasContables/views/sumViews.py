@@ -534,36 +534,19 @@ class TotalActivoView(APIView):
 
 class TotalPasivoYPatrimonioView(APIView):
     """
-    Calcula el Total Patrimonio Neto y Pasivo según el BOE (Solo Sección C)
-    con principios contables correctos y estructura BOE exacta.
-
-    TOTAL PATRIMONIO Y PASIVO = A) PATRIMONIO NETO + B) PASIVO NO CORRIENTE + C) PASIVO CORRIENTE
-
-    Parámetros opcionales:
-    - ?incluir_detalle=true : incluir desglose completo
-    - ?comparar_activo=true : comparar con total activo
-    - ?estructura_boe=true : agrupar según estructura BOE exacta
+    Calcula el Total Patrimonio Neto y Pasivo según el BOE
     """
 
     def get(self, request, *args, **kwargs):
-        # Parámetros de consulta
         incluir_detalle = request.GET.get('incluir_detalle', 'true').lower() == 'true'
         comparar_activo = request.GET.get('comparar_activo', 'false').lower() == 'true'
         estructura_boe = request.GET.get('estructura_boe', 'true').lower() == 'true'
 
-        # SOLO Sección C según BOE
-        seccion_c = SeccionContable.objects.filter(letra="C").prefetch_related("areas__subareas").first()
+        secciones = SeccionContable.objects.filter(letra__in=["C", "D", "E"]).prefetch_related("areas__subareas")
 
-        if not seccion_c:
-            return Response({
-                "error": "No se encontró la Sección C (Patrimonio Neto y Pasivo)",
-                "solucion": "Verificar que la sección C esté cargada correctamente"
-            }, status=status.HTTP_404_NOT_FOUND)
-
-        # Inicializar totales según estructura BOE
-        patrimonio_neto = Decimal(0)  # A) PATRIMONIO NETO
-        pasivo_no_corriente = Decimal(0)  # B) PASIVO NO CORRIENTE
-        pasivo_corriente = Decimal(0)  # C) PASIVO CORRIENTE
+        patrimonio_neto = Decimal(0)
+        pasivo_no_corriente = Decimal(0)
+        pasivo_corriente = Decimal(0)
 
         detalle_estructura = {
             "A_PATRIMONIO_NETO": {"saldo": Decimal(0), "areas": []},
@@ -571,407 +554,127 @@ class TotalPasivoYPatrimonioView(APIView):
             "C_PASIVO_CORRIENTE": {"saldo": Decimal(0), "areas": []}
         }
 
-        total_debe_seccion = Decimal(0)
-        total_haber_seccion = Decimal(0)
+        total_debe = Decimal(0)
+        total_haber = Decimal(0)
 
-        # Procesar todas las áreas de la Sección C
-        for area in seccion_c.areas.all():
-            area_saldo = Decimal(0)
-            area_debe = Decimal(0)
-            area_haber = Decimal(0)
-            subareas_detalle = []
+        for seccion in secciones:
+            letra = seccion.letra
+            for area in seccion.areas.all():
+                area_debe = Decimal(0)
+                area_haber = Decimal(0)
+                subareas_detalle = []
 
-            # Determinar a qué grupo BOE pertenece esta área
-            grupo_boe = self._clasificar_area_segun_boe(area)
+                for subarea in area.subareas.all():
+                    datos = self._calcular_saldo(subarea)
+                    area_debe += datos["debe"]
+                    area_haber += datos["haber"]
 
-            for subarea in area.subareas.all():
-                # Obtener totales de debe y haber (campos independientes)
-                datos_subarea = self._calcular_saldo_pasivo_patrimonio(subarea)
+                    if incluir_detalle:
+                        subareas_detalle.append({
+                            "nombre": subarea.nombre,
+                            "codigos_positivos": subarea.codigos_positivos,
+                            "codigos_negativos": subarea.codigos_negativos,
+                            "debe": float(datos["debe"]),
+                            "haber": float(datos["haber"]),
+                            "total_lineas": datos["total_lineas"]
+                        })
 
-                # Acumular debe y haber por área
-                area_debe += datos_subarea["debe"]
-                area_haber += datos_subarea["haber"]
+                total_debe += area_debe
+                total_haber += area_haber
+                total_mov = area_debe + area_haber
 
-                if incluir_detalle:
-                    subareas_detalle.append({
-                        "nombre": subarea.nombre,
-                        "codigos_positivos": subarea.codigos_positivos,
-                        "codigos_negativos": subarea.codigos_negativos,
-                        "debe": float(datos_subarea["debe"]),
-                        "haber": float(datos_subarea["haber"]),
-                        "total_lineas": datos_subarea["total_lineas"]
-                    })
+                area_info = {
+                    "nombre": area.nombre,
+                    "abreviatura": area.abreviatura,
+                    "debe": float(area_debe),
+                    "haber": float(area_haber),
+                    "total_movimientos": float(total_mov),
+                    "subareas": subareas_detalle if incluir_detalle else []
+                }
 
-            total_debe_seccion += area_debe
-            total_haber_seccion += area_haber
+                if letra == "C":
+                    patrimonio_neto += total_mov
+                    detalle_estructura["A_PATRIMONIO_NETO"]["saldo"] += total_mov
+                    detalle_estructura["A_PATRIMONIO_NETO"]["areas"].append(area_info)
+                elif letra == "D":
+                    pasivo_no_corriente += total_mov
+                    detalle_estructura["B_PASIVO_NO_CORRIENTE"]["saldo"] += total_mov
+                    detalle_estructura["B_PASIVO_NO_CORRIENTE"]["areas"].append(area_info)
+                elif letra == "E":
+                    pasivo_corriente += total_mov
+                    detalle_estructura["C_PASIVO_CORRIENTE"]["saldo"] += total_mov
+                    detalle_estructura["C_PASIVO_CORRIENTE"]["areas"].append(area_info)
 
-            # Acumular debe y haber por grupo BOE
-            if grupo_boe == "PATRIMONIO_NETO":
-                patrimonio_neto += area_debe + area_haber  # Total de movimientos del patrimonio
-                detalle_estructura["A_PATRIMONIO_NETO"]["saldo"] += area_debe + area_haber
-                clave_detalle = "A_PATRIMONIO_NETO"
-            elif grupo_boe == "PASIVO_NO_CORRIENTE":
-                pasivo_no_corriente += area_debe + area_haber  # Total de movimientos del pasivo LP
-                detalle_estructura["B_PASIVO_NO_CORRIENTE"]["saldo"] += area_debe + area_haber
-                clave_detalle = "B_PASIVO_NO_CORRIENTE"
-            elif grupo_boe == "PASIVO_CORRIENTE":
-                pasivo_corriente += area_debe + area_haber  # Total de movimientos del pasivo CP
-                detalle_estructura["C_PASIVO_CORRIENTE"]["saldo"] += area_debe + area_haber
-                clave_detalle = "C_PASIVO_CORRIENTE"
-            else:
-                # Caso por defecto
-                patrimonio_neto += area_debe + area_haber
-                detalle_estructura["A_PATRIMONIO_NETO"]["saldo"] += area_debe + area_haber
-                clave_detalle = "A_PATRIMONIO_NETO"
+        total_pp = patrimonio_neto + pasivo_no_corriente + pasivo_corriente
+        porcentaje = lambda val: round(float(val / total_pp * 100), 2) if total_pp else 0
 
-            # Guardar detalle del área
-            area_info = {
-                "nombre": area.nombre,
-                "abreviatura": area.abreviatura,
-                "debe": float(area_debe),
-                "haber": float(area_haber),
-                "total_movimientos": float(area_debe + area_haber),
-                "grupo_boe": grupo_boe,
-                "subareas": subareas_detalle if incluir_detalle else [],
-                "metadata": self._obtener_metadata_area_patrimonio_pasivo(area, grupo_boe)
-            }
-
-            detalle_estructura[clave_detalle]["areas"].append(area_info)
-
-        # Calcular total
-        total_patrimonio_y_pasivo = patrimonio_neto + pasivo_no_corriente + pasivo_corriente
-
-        # Calcular porcentajes
-        porcentajes = {}
-        if total_patrimonio_y_pasivo != 0:
-            porcentajes = {
-                "patrimonio_neto": round(float(patrimonio_neto / total_patrimonio_y_pasivo * 100), 2),
-                "pasivo_no_corriente": round(float(pasivo_no_corriente / total_patrimonio_y_pasivo * 100), 2),
-                "pasivo_corriente": round(float(pasivo_corriente / total_patrimonio_y_pasivo * 100), 2)
-            }
-
-        # Preparar respuesta base
         respuesta = {
             "total_patrimonio_y_pasivo": {
-                "total_debe": float(total_debe_seccion),
-                "total_haber": float(total_haber_seccion),
-                "total_movimientos": float(total_debe_seccion + total_haber_seccion),
-                "formula": "DEBE + HABER de todas las áreas/subáreas de Sección C",
+                "total_debe": float(total_debe),
+                "total_haber": float(total_haber),
+                "total_movimientos": float(total_debe + total_haber),
                 "estructura": "A) PATRIMONIO NETO + B) PASIVO NO CORRIENTE + C) PASIVO CORRIENTE"
             },
             "componentes_boe": {
                 "A_patrimonio_neto": {
                     "total_movimientos": float(patrimonio_neto),
-                    "porcentaje": porcentajes.get("patrimonio_neto", 0),
-                    "descripcion": "Fondos propios, ajustes de valor y subvenciones"
+                    "porcentaje": porcentaje(patrimonio_neto)
                 },
                 "B_pasivo_no_corriente": {
                     "total_movimientos": float(pasivo_no_corriente),
-                    "porcentaje": porcentajes.get("pasivo_no_corriente", 0),
-                    "descripcion": "Obligaciones y deudas a largo plazo"
+                    "porcentaje": porcentaje(pasivo_no_corriente)
                 },
                 "C_pasivo_corriente": {
                     "total_movimientos": float(pasivo_corriente),
-                    "porcentaje": porcentajes.get("pasivo_corriente", 0),
-                    "descripcion": "Obligaciones y deudas a corto plazo"
+                    "porcentaje": porcentaje(pasivo_corriente)
                 }
             },
             "estructura_detallada": detalle_estructura if estructura_boe else {},
             "validaciones": {
-                "sumas_cuadran": abs(
-                    total_patrimonio_y_pasivo - (patrimonio_neto + pasivo_no_corriente + pasivo_corriente)) < 0.01,
-                "solo_seccion_c": True,
-                "estructura_boe_completa": self._validar_estructura_boe_completa(detalle_estructura),
-                "saldos_coherentes": self._validar_coherencia_saldos(patrimonio_neto, pasivo_no_corriente,
-                                                                     pasivo_corriente)
+                "estructura_completa": all([
+                    patrimonio_neto >= 0,
+                    pasivo_no_corriente >= 0,
+                    pasivo_corriente >= 0
+                ])
             }
         }
 
-        # Comparación con Total Activo si se solicita
         if comparar_activo:
             total_activo = self._calcular_total_activo()
             respuesta["comparacion_balance"] = {
                 "total_activo": float(total_activo),
-                "diferencia": float(total_activo - total_patrimonio_y_pasivo),
-                "balance_cuadra": abs(total_activo - total_patrimonio_y_pasivo) < 0.01,
-                "interpretacion": self._interpretar_balance_general(total_activo, total_patrimonio_y_pasivo),
-                "ecuacion_fundamental": "ACTIVO = PASIVO + PATRIMONIO NETO"
+                "total_pasivo_patrimonio": float(total_pp),
+                "diferencia": float(total_activo - total_pp),
+                "balance_cuadra": abs(total_activo - total_pp) < 0.01
             }
 
-        # Ratios financieros
-        respuesta["ratios_financieros"] = {
-            "autonomia_financiera": float(
-                patrimonio_neto / total_patrimonio_y_pasivo * 100) if total_patrimonio_y_pasivo != 0 else 0,
-            "endeudamiento": float((
-                                           pasivo_no_corriente + pasivo_corriente) / total_patrimonio_y_pasivo * 100) if total_patrimonio_y_pasivo != 0 else 0,
-            "estructura_pasivo": {
-                "pasivo_largo_plazo": float(pasivo_no_corriente / (pasivo_no_corriente + pasivo_corriente) * 100) if (
-                                                                                                                             pasivo_no_corriente + pasivo_corriente) != 0 else 0,
-                "pasivo_corto_plazo": float(pasivo_corriente / (pasivo_no_corriente + pasivo_corriente) * 100) if (
-                                                                                                                          pasivo_no_corriente + pasivo_corriente) != 0 else 0
-            },
-            "interpretacion": self._interpretar_estructura_financiera(patrimonio_neto, pasivo_no_corriente,
-                                                                      pasivo_corriente)
-        }
+        return Response(respuesta)
 
-        # Metadata
-        respuesta["metadata"] = {
-            "seccion_boe": "C) PATRIMONIO NETO Y PASIVO",
-            "principio_calculo": "Sumatoria de DEBE y HABER por separado de todas las áreas/subáreas de Sección C",
-            "campos_resultado": {
-                "total_debe": "Suma de todos los valores DEBE",
-                "total_haber": "Suma de todos los valores HABER",
-                "total_movimientos": "DEBE + HABER (para referencia)"
-            },
-            "areas_incluidas": "Todas las áreas/subáreas clasificadas en Sección C",
-            "parametros_consulta": {
-                "incluir_detalle": incluir_detalle,
-                "comparar_activo": comparar_activo,
-                "estructura_boe": estructura_boe
-            }
-        }
-
-        return Response(respuesta, status=status.HTTP_200_OK)
-
-    def _calcular_saldo_pasivo_patrimonio(self, subarea):
-        """
-        Obtiene los totales de debe y haber de una subárea.
-        NO se suman entre sí, son campos independientes para mostrar.
-        """
+    def _calcular_saldo(self, subarea):
         lineas = LineaFactura.objects.filter(subarea=subarea)
-
         agregados = lineas.aggregate(
             debe_total=Sum('debe'),
             haber_total=Sum('haber')
         )
-
-        debe = agregados["debe_total"] or Decimal(0)
-        haber = agregados["haber_total"] or Decimal(0)
-        total_lineas = lineas.count()
-
         return {
-            "debe": debe,
-            "haber": haber,
-            "total_lineas": total_lineas
+            "debe": agregados["debe_total"] or Decimal(0),
+            "haber": agregados["haber_total"] or Decimal(0),
+            "total_lineas": lineas.count()
         }
-
-    def _clasificar_area_segun_boe(self, area):
-        """
-        Clasifica el área según la estructura BOE exacta
-        """
-        nombre_upper = area.nombre.upper()
-
-        # A) PATRIMONIO NETO
-        if any(keyword in nombre_upper for keyword in [
-            "PATRIMONIO NETO", "A) PATRIMONIO", "FONDOS PROPIOS",
-            "CAPITAL", "RESERVAS", "RESULTADO", "AJUSTES POR CAMBIOS",
-            "SUBVENCIONES", "DONACIONES", "LEGADOS"
-        ]):
-            return "PATRIMONIO_NETO"
-
-        # B) PASIVO NO CORRIENTE
-        elif any(keyword in nombre_upper for keyword in [
-            "B) PASIVO NO CORRIENTE", "PASIVO NO CORRIENTE",
-            "LARGO PLAZO", "PROVISIONES A LARGO", "DEUDAS A LARGO"
-        ]):
-            return "PASIVO_NO_CORRIENTE"
-
-        # C) PASIVO CORRIENTE
-        elif any(keyword in nombre_upper for keyword in [
-            "C) PASIVO CORRIENTE", "PASIVO CORRIENTE",
-            "CORTO PLAZO", "PROVISIONES A CORTO", "DEUDAS A CORTO",
-            "ACREEDORES COMERCIALES"
-        ]):
-            return "PASIVO_CORRIENTE"
-
-        # Por defecto, si no se puede clasificar claramente
-        else:
-            # Intentar clasificar por keywords adicionales
-            if any(keyword in nombre_upper for keyword in [
-                "PROVISIONES", "ACREEDORES", "PROVEEDORES", "DEUDAS"
-            ]):
-                return "PASIVO_CORRIENTE"  # Por defecto asumir corto plazo
-            else:
-                return "PATRIMONIO_NETO"  # Por defecto asumir patrimonio
 
     def _calcular_total_activo(self):
-        """
-        Calcula el total de áreas clasificadas como activo (Secciones A + B)
-        """
-        secciones_activo = SeccionContable.objects.filter(letra__in=["A", "B"])
-        total_areas = 0
-
-        for seccion in secciones_activo:
+        secciones = SeccionContable.objects.filter(letra__in=["A", "B"])
+        total = Decimal(0)
+        for seccion in secciones:
             for area in seccion.areas.all():
-                total_areas += 1  # Cuenta cada área como 1 unidad
-
-        return total_areas
-
-    def _interpretar_saldo_pasivo_patrimonio(self, total_subarea, grupo_boe):
-        """
-        Interpreta el total de la subárea (debe + haber)
-        """
-        if total_subarea > 0:
-            if grupo_boe == "PATRIMONIO_NETO":
-                return f"Total patrimonio neto: €{total_subarea:,.2f}"
-            else:
-                return f"Total pasivo: €{total_subarea:,.2f}"
-        else:
-            return "Sin movimientos"
-
-    def _validar_estructura_boe_completa(self, detalle_estructura):
-        """
-        Valida que estén presentes los 3 componentes del BOE
-        """
-        return all(
-            detalle_estructura[grupo]["saldo"] >= 0
-            for grupo in ["A_PATRIMONIO_NETO", "B_PASIVO_NO_CORRIENTE", "C_PASIVO_CORRIENTE"]
-        )
-
-    def _validar_coherencia_saldos(self, patrimonio_neto, pasivo_no_corriente, pasivo_corriente):
-        """
-        Valida que los saldos sean coherentes
-        """
-        return all(saldo >= 0 for saldo in [patrimonio_neto, pasivo_no_corriente, pasivo_corriente])
-
-    def _interpretar_balance_general(self, total_activo, total_patrimonio_pasivo):
-        """
-        Interpreta el balance general
-        """
-        diferencia = abs(total_activo - total_patrimonio_pasivo)
-
-        if diferencia < 0.01:
-            return "✅ Balance perfecto: ACTIVO = PASIVO + PATRIMONIO"
-        elif diferencia < 100:
-            return f"⚠️ Diferencia menor: €{diferencia:.2f}"
-        else:
-            return f"❌ Balance descuadrado: €{diferencia:,.2f}"
-
-    def _interpretar_estructura_financiera(self, patrimonio_neto, pasivo_no_corriente, pasivo_corriente):
-        """
-        Interpreta la estructura financiera de la empresa
-        """
-        total = patrimonio_neto + pasivo_no_corriente + pasivo_corriente
-        if total == 0:
-            return "Sin estructura financiera"
-
-        ratio_patrimonio = float(patrimonio_neto / total)
-        ratio_pasivo_corriente = float(pasivo_corriente / total)
-
-        if ratio_patrimonio > 0.6:
-            return "Empresa con alta autonomía financiera"
-        elif ratio_patrimonio > 0.3:
-            return "Estructura financiera equilibrada"
-        elif ratio_pasivo_corriente > 0.5:
-            return "Alta dependencia de financiación a corto plazo"
-        else:
-            return "Empresa muy endeudada"
-
-    def _obtener_metadata_area_patrimonio_pasivo(self, area, grupo_boe):
-        """
-        Metadata específica para áreas de patrimonio/pasivo
-        """
-        return {
-            "grupo_boe": grupo_boe,
-            "naturaleza_contable": "ACREEDORA",
-            "descripcion": area.descripcion,
-            "es_patrimonio": grupo_boe == "PATRIMONIO_NETO",
-            "es_pasivo": grupo_boe in ["PASIVO_NO_CORRIENTE", "PASIVO_CORRIENTE"],
-            "plazo": "LARGO" if grupo_boe == "PASIVO_NO_CORRIENTE" else "CORTO" if grupo_boe == "PASIVO_CORRIENTE" else "NO_APLICA"
-        }
-
-
-class EstadoResultadosView(APIView):
-    """
-    Devuelve el estado de resultados (Cuenta de Pérdidas y Ganancias),
-    limitando los cálculos solo a las áreas de la Sección D.
-    """
-
-    def get(self, request, *args, **kwargs):
-        # Filtrar solo áreas de la sección D
-        areas_seccion_d = AreaContable.objects.filter(seccion__letra="D").prefetch_related("subareas")
-        subareas_d = [sub for area in areas_seccion_d for sub in area.subareas.all()]
-
-        detalle = []
-        total_debe = Decimal(0)
-        total_haber = Decimal(0)
-
-        # Mapeo para cálculos individuales
-        resultado_explotacion_subareas = []
-        resultado_financiero_subareas = []
-        impuesto_sobre_beneficios_subareas = []
-
-        # Iterar por cada área de sección D
-        for area in areas_seccion_d:
-            area_debe = Decimal(0)
-            area_haber = Decimal(0)
-            subarea_detalles = []
-
-            for subarea in area.subareas.all():
-                lineas = LineaFactura.objects.filter(subarea=subarea)
-                debe = sum(linea.debe or Decimal(0) for linea in lineas)
-                haber = sum(linea.haber or Decimal(0) for linea in lineas)
-
-                # Acumulados generales
-                total_debe += debe
-                total_haber += haber
-                area_debe += debe
-                area_haber += haber
-
-                # Guardar detalle por subárea
-                subarea_detalles.append({
-                    "nombre": subarea.nombre,
-                    "debe": float(debe),
-                    "haber": float(haber)
-                })
-
-                # Clasificación para cálculos específicos
-                if "RESULTADO DE EXPLOTACIÓN" not in subarea.nombre.upper() and \
-                        "RESULTADO FINANCIERO" not in subarea.nombre.upper() and \
-                        "RESULTADO ANTES" not in subarea.nombre.upper() and \
-                        "RESULTADO DEL EJERCICIO" not in subarea.nombre.upper():
-
-                    if "financier" in subarea.nombre.lower():
-                        resultado_financiero_subareas.append((debe, haber))
-                    elif "impuesto" in subarea.nombre.lower():
-                        impuesto_sobre_beneficios_subareas.append((debe, haber))
-                    else:
-                        resultado_explotacion_subareas.append((debe, haber))
-
-            # Guardar el área con sus subáreas
-            detalle.append({
-                "nombre": area.nombre,
-                "debe": float(area_debe),
-                "haber": float(area_haber),
-                "subareas": subarea_detalles
-            })
-
-        # Calcular resultados
-        def calcular_resultado(sumas):
-            total_debe = sum(d for d, h in sumas)
-            total_haber = sum(h for d, h in sumas)
-            return float(total_haber - total_debe)
-
-        resultado_explotacion = calcular_resultado(resultado_explotacion_subareas)
-        resultado_financiero = calcular_resultado(resultado_financiero_subareas)
-        resultado_antes_impuestos = resultado_explotacion + resultado_financiero
-        resultado_ejercicio = resultado_antes_impuestos - calcular_resultado(impuesto_sobre_beneficios_subareas)
-
-        return Response({
-            "total_estado_resultados": {
-                "debe": float(total_debe),
-                "haber": float(total_haber),
-                "balanceado": total_debe == total_haber
-            },
-            "detalle": detalle,
-            "resultados": {
-                "resultado_explotacion": resultado_explotacion,
-                "resultado_financiero": resultado_financiero,
-                "resultado_antes_impuestos": resultado_antes_impuestos,
-                "resultado_del_ejercicio": resultado_ejercicio
-            }
-        }, status=status.HTTP_200_OK)
-
+                for subarea in area.subareas.all():
+                    lineas = LineaFactura.objects.filter(subarea=subarea)
+                    datos = lineas.aggregate(
+                        debe_total=Sum("debe"),
+                        haber_total=Sum("haber")
+                    )
+                    total += (datos["debe_total"] or Decimal(0)) - (datos["haber_total"] or Decimal(0))
+        return total
 
 class EstadoResultadosCorregidoView(APIView):
     """
@@ -981,7 +684,7 @@ class EstadoResultadosCorregidoView(APIView):
 
     def get(self, request, *args, **kwargs):
         # Filtrar solo áreas de la sección D
-        areas_seccion_d = AreaContable.objects.filter(seccion__letra="D").prefetch_related("subareas")
+        areas_seccion_f = AreaContable.objects.filter(seccion__letra="F").prefetch_related("subareas")
 
         detalle = []
         total_debe = Decimal(0)
@@ -997,7 +700,7 @@ class EstadoResultadosCorregidoView(APIView):
         impuestos_beneficios = Decimal(0)
 
         # Iterar por cada área de sección D
-        for area in areas_seccion_d:
+        for area in areas_seccion_f:
             area_debe = Decimal(0)
             area_haber = Decimal(0)
             subarea_detalles = []
@@ -1161,3 +864,70 @@ class EstadoResultadosCorregidoView(APIView):
             return f"Pérdida pequeña de €{abs(resultado):,.2f}"
         else:
             return f"Pérdida de €{abs(resultado):,.2f}"
+
+
+class IngresosGastosReconocidosView(APIView):
+    """
+    Calcula el total de ingresos y gastos reconocidos (Sección G) según BOE.
+    Incluye ingresos imputados directamente al patrimonio neto y transferencias a PyG.
+    """
+
+    def get(self, request, *args, **kwargs):
+        areas_g = AreaContable.objects.filter(seccion__letra="G").prefetch_related("subareas")
+
+        total_ingresos = Decimal(0)
+        total_gastos = Decimal(0)
+        detalle = []
+
+        for area in areas_g:
+            area_debe = Decimal(0)
+            area_haber = Decimal(0)
+            subarea_detalles = []
+
+            for subarea in area.subareas.all():
+                lineas = LineaFactura.objects.filter(subarea=subarea)
+                debe = sum(linea.debe or Decimal(0) for linea in lineas)
+                haber = sum(linea.haber or Decimal(0) for linea in lineas)
+
+                area_debe += debe
+                area_haber += haber
+
+                subarea_detalles.append({
+                    "nombre": subarea.nombre,
+                    "debe": float(debe),
+                    "haber": float(haber)
+                })
+
+            total_ingresos += area_haber
+            total_gastos += area_debe
+
+            detalle.append({
+                "nombre": area.nombre,
+                "debe": float(area_debe),
+                "haber": float(area_haber),
+                "subareas": subarea_detalles
+            })
+
+        resultado_final = total_ingresos - total_gastos
+
+        return Response({
+            "total_ingresos_y_gastos_reconocidos": {
+                "debe": float(total_gastos),
+                "haber": float(total_ingresos),
+                "resultado": float(resultado_final),
+                "interpretacion": self._interpretar_resultado(resultado_final)
+            },
+            "detalle": detalle
+        }, status=status.HTTP_200_OK)
+
+    def _interpretar_resultado(self, resultado):
+        if resultado > 1000:
+            return f"Reconocimiento positivo de €{resultado:,.2f}"
+        elif resultado > 0:
+            return f"Ligero reconocimiento positivo de €{resultado:,.2f}"
+        elif resultado == 0:
+            return "Sin impacto reconocido"
+        elif resultado > -1000:
+            return f"Ligera pérdida reconocida de €{abs(resultado):,.2f}"
+        else:
+            return f"Pérdida reconocida de €{abs(resultado):,.2f}"

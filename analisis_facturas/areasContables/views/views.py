@@ -721,3 +721,11 @@ class LineasFacturaListView(APIView):
 
         serializer = LineaFacturaSerializer(lineas, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class LineasFacturaSampleListView(APIView):
+    def get(self, request, *args, **kwargs):
+        lineas = LineaFactura.objects.all().order_by("fecha", "asiento")
+
+        serializer = LineaFacturaSerializer(lineas, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)

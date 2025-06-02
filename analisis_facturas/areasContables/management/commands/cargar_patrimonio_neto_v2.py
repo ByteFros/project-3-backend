@@ -9,7 +9,7 @@ class Command(BaseCommand):
         # Crear sección C con nomenclatura BOE
         seccion_c, _ = SeccionContable.objects.get_or_create(
             letra="C",
-            defaults={"nombre": "C) PATRIMONIO NETO Y PASIVO"}
+            defaults={"nombre": "C) PATRIMONIO NETO"}
         )
 
         estructura = [

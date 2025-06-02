@@ -4,6 +4,7 @@ class SeccionContable(models.Model):
     nombre = models.CharField(max_length=100)
     letra = models.CharField(max_length=2, unique=True)
 
+
     def __str__(self):
         return f"{self.letra} - {self.nombre}"
 

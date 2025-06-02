@@ -6,9 +6,9 @@ class Command(BaseCommand):
     help = 'Carga áreas 12-17 de Pérdidas y Ganancias con numeración exacta BOE para cálculo RESULTADO FINANCIERO'
 
     def handle(self, *args, **options):
-        seccion_d, _ = SeccionContable.objects.get_or_create(
-            letra="D",
-            defaults={"nombre": "D) CUENTA DE PÉRDIDAS Y GANANCIAS"}
+        seccion_f, _ = SeccionContable.objects.get_or_create(
+            letra="F",
+            defaults={"nombre": "F) CUENTA DE PÉRDIDAS Y GANANCIAS"}
         )
 
         estructura = [
@@ -42,7 +42,7 @@ class Command(BaseCommand):
         for nombre, abrev, descripcion, subareas in estructura:
             area, created = AreaContable.objects.get_or_create(
                 nombre=nombre,
-                seccion=seccion_d,
+                seccion=seccion_f,
                 defaults={
                     "abreviatura": abrev,
                     "descripcion": descripcion

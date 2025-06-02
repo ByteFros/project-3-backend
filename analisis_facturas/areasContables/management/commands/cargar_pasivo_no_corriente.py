@@ -7,9 +7,9 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         # Crear sección C si no existe
-        seccion_c, _ = SeccionContable.objects.get_or_create(
-            letra="C",
-            defaults={"nombre": "PATRIMONIO NETO Y PASIVO"}
+        seccion_d, _ = SeccionContable.objects.get_or_create(
+            letra="D",
+            defaults={"nombre": "D) PASIVO NO CORRIENTE"}
         )
 
         estructura = [
@@ -44,7 +44,7 @@ class Command(BaseCommand):
         for nombre, abrev, descripcion, subareas in estructura:
             area, created = AreaContable.objects.get_or_create(
                 nombre=nombre,
-                seccion=seccion_c,
+                seccion=seccion_d,
                 defaults={
                     "abreviatura": abrev,
                     "descripcion": descripcion
