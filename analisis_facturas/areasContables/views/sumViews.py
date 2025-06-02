@@ -1,10 +1,12 @@
 from ..models import SeccionContable, AreaContable, SubAreaContable, LineaFactura
-from decimal import Decimal
+import re
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from django.db.models import Sum, Q
-import re
+from decimal import Decimal
+from django.db.models import Sum
+from areasContables.utils.codigos_boe import ACTIVO_NO_CORRIENTE, ACTIVO_CORRIENTE
+
 
 
 class SumatoriasBOEView(APIView):
@@ -235,6 +237,131 @@ class SumatoriasBOEView(APIView):
                 metadata["es_pasivo_corriente"] = True
 
         return metadata
+
+
+
+class TotalActivoCodigosView(APIView):
+    """
+    Calcula el Total Activo basado en los códigos definidos en utils/codigos_boe.py,
+    sin depender de modelos Seccion/Area/Subarea en base de datos.
+    """
+
+    def get(self, request, *args, **kwargs):
+        incluir_detalle = request.GET.get('incluir_detalle', 'true').lower() == 'true'
+
+        total_activo = Decimal(0)
+        total_debe = Decimal(0)
+        total_haber = Decimal(0)
+        detalle_secciones = []
+
+        for letra, seccion_data in [("A", ACTIVO_NO_CORRIENTE), ("B", ACTIVO_CORRIENTE)]:
+            seccion_saldo = Decimal(0)
+            seccion_debe = Decimal(0)
+            seccion_haber = Decimal(0)
+            areas_detalle = []
+
+            for nombre_area, area_data in seccion_data.items():
+                area_saldo = Decimal(0)
+                area_debe = Decimal(0)
+                area_haber = Decimal(0)
+                subareas_detalle = []
+
+                for nombre_subarea, codigos in area_data["subareas"].items():
+                    resultado = self._calcular_saldo_por_codigos(codigos)
+                    area_saldo += resultado["saldo"]
+                    area_debe += resultado["debe"]
+                    area_haber += resultado["haber"]
+
+                    if incluir_detalle:
+                        subareas_detalle.append({
+                            "nombre": nombre_subarea,
+                            "debe": float(resultado["debe"]),
+                            "haber": float(resultado["haber"]),
+                            "saldo": float(resultado["saldo"]),
+                            "total_lineas": resultado["total_lineas"]
+                        })
+
+                seccion_saldo += area_saldo
+                seccion_debe += area_debe
+                seccion_haber += area_haber
+
+                if incluir_detalle:
+                    areas_detalle.append({
+                        "nombre": nombre_area,
+                        "saldo": float(area_saldo),
+                        "debe": float(area_debe),
+                        "haber": float(area_haber),
+                        "subareas": subareas_detalle
+                    })
+
+            detalle_secciones.append({
+                "letra": letra,
+                "nombre": "Activo no corriente" if letra == "A" else "Activo corriente",
+                "saldo": float(seccion_saldo),
+                "debe": float(seccion_debe),
+                "haber": float(seccion_haber),
+                "areas": areas_detalle
+            })
+
+            total_activo += seccion_saldo
+            total_debe += seccion_debe
+            total_haber += seccion_haber
+
+        respuesta = {
+            "total_activo": {
+                "saldo": float(total_activo),
+                "debe_total": float(total_debe),
+                "haber_total": float(total_haber),
+                "formula": "ACTIVO NO CORRIENTE + ACTIVO CORRIENTE"
+            },
+            "detalle_por_seccion": detalle_secciones,
+            "validaciones": {
+                "sumas_cuadran": abs(total_activo - (total_debe - total_haber)) < 0.01,
+                "tiene_activos": total_activo > 0
+            }
+        }
+
+        return Response(respuesta, status=status.HTTP_200_OK)
+
+
+
+    def _calcular_saldo_por_codigos(self, codigos):
+        sumar = codigos.get("sumar", [])
+        restar = codigos.get("restar", [])
+
+        # Acumuladores para valores finales
+        debe_total = Decimal(0)
+        haber_total = Decimal(0)
+        count_total = 0
+
+        # Procesar códigos a SUMAR: agregar sus valores al total
+        for codigo in sumar:
+            lineas = LineaFactura.objects.filter(cuenta__startswith=str(codigo))
+            debe_total += lineas.aggregate(total=Sum("debe"))["total"] or Decimal(0)
+            haber_total += lineas.aggregate(total=Sum("haber"))["total"] or Decimal(0)
+            count_total += lineas.count()
+
+        # Procesar códigos a RESTAR: restar sus valores del total
+        for codigo in restar:
+            lineas = LineaFactura.objects.filter(cuenta__startswith=str(codigo))
+            debe_restar = lineas.aggregate(total=Sum("debe"))["total"] or Decimal(0)
+            haber_restar = lineas.aggregate(total=Sum("haber"))["total"] or Decimal(0)
+            
+            # RESTAR estos valores del total (como correctores)
+            debe_total -= debe_restar
+            haber_total -= haber_restar
+            count_total += lineas.count()
+
+        # El saldo es simplemente debe menos haber (naturaleza de activo)
+        saldo_total = debe_total - haber_total
+
+        return {
+            "debe": debe_total,
+            "haber": haber_total,
+            "saldo": saldo_total,
+            "total_lineas": count_total
+        }
+
 
 
 class TotalActivoView(APIView):
@@ -676,195 +803,6 @@ class TotalPasivoYPatrimonioView(APIView):
                     total += (datos["debe_total"] or Decimal(0)) - (datos["haber_total"] or Decimal(0))
         return total
 
-class EstadoResultadosCorregidoView(APIView):
-    """
-    Estado de Resultados con cálculo correcto de pérdidas y ganancias.
-    Calcula los resultados según los principios contables españoles.
-    """
-
-    def get(self, request, *args, **kwargs):
-        # Filtrar solo áreas de la sección D
-        areas_seccion_f = AreaContable.objects.filter(seccion__letra="F").prefetch_related("subareas")
-
-        detalle = []
-        total_debe = Decimal(0)
-        total_haber = Decimal(0)
-
-        # Clasificaciones contables específicas para cálculos
-        ingresos_explotacion = Decimal(0)
-        gastos_explotacion = Decimal(0)
-        ingresos_financieros = Decimal(0)
-        gastos_financieros = Decimal(0)
-        ingresos_extraordinarios = Decimal(0)
-        gastos_extraordinarios = Decimal(0)
-        impuestos_beneficios = Decimal(0)
-
-        # Iterar por cada área de sección D
-        for area in areas_seccion_f:
-            area_debe = Decimal(0)
-            area_haber = Decimal(0)
-            subarea_detalles = []
-
-            for subarea in area.subareas.all():
-                lineas = LineaFactura.objects.filter(subarea=subarea)
-                debe = sum(linea.debe or Decimal(0) for linea in lineas)
-                haber = sum(linea.haber or Decimal(0) for linea in lineas)
-
-                # Acumulados generales
-                total_debe += debe
-                total_haber += haber
-                area_debe += debe
-                area_haber += haber
-
-                # Guardar detalle por subárea
-                subarea_detalles.append({
-                    "nombre": subarea.nombre,
-                    "debe": float(debe),
-                    "haber": float(haber)
-                })
-
-                # **CLASIFICACIÓN CONTABLE CORRECTA**
-                area_nombre_lower = area.nombre.lower()
-                subarea_nombre_lower = subarea.nombre.lower()
-
-                # Clasificar según el tipo de cuenta para cálculo de resultados
-                if self._es_ingreso_explotacion(area_nombre_lower, subarea_nombre_lower):
-                    # Ingresos: el saldo es HABER - DEBE
-                    ingresos_explotacion += (haber - debe)
-
-                elif self._es_gasto_explotacion(area_nombre_lower, subarea_nombre_lower):
-                    # Gastos: el saldo es DEBE - HABER (se resta de ingresos)
-                    gastos_explotacion += (debe - haber)
-
-                elif self._es_ingreso_financiero(area_nombre_lower, subarea_nombre_lower):
-                    ingresos_financieros += (haber - debe)
-
-                elif self._es_gasto_financiero(area_nombre_lower, subarea_nombre_lower):
-                    gastos_financieros += (debe - haber)
-
-                elif self._es_ingreso_extraordinario(area_nombre_lower, subarea_nombre_lower):
-                    ingresos_extraordinarios += (haber - debe)
-
-                elif self._es_gasto_extraordinario(area_nombre_lower, subarea_nombre_lower):
-                    gastos_extraordinarios += (debe - haber)
-
-                elif self._es_impuesto_beneficios(area_nombre_lower, subarea_nombre_lower):
-                    impuestos_beneficios += (debe - haber)
-
-            # Guardar el área con sus subáreas
-            detalle.append({
-                "nombre": area.nombre,
-                "debe": float(area_debe),
-                "haber": float(area_haber),
-                "subareas": subarea_detalles
-            })
-
-        # **CÁLCULO CORRECTO DE RESULTADOS**
-        resultado_explotacion = ingresos_explotacion - gastos_explotacion
-        resultado_financiero = ingresos_financieros - gastos_financieros
-        resultado_extraordinario = ingresos_extraordinarios - gastos_extraordinarios
-        resultado_antes_impuestos = resultado_explotacion + resultado_financiero + resultado_extraordinario
-        resultado_del_ejercicio = resultado_antes_impuestos - impuestos_beneficios
-
-        return Response({
-            "total_estado_resultados": {
-                "debe": float(total_debe),
-                "haber": float(total_haber),
-                "balanceado": total_debe == total_haber
-            },
-            "detalle": detalle,
-            "resultados": {
-                "ingresos_explotacion": float(ingresos_explotacion),
-                "gastos_explotacion": float(gastos_explotacion),
-                "resultado_explotacion": float(resultado_explotacion),
-
-                "ingresos_financieros": float(ingresos_financieros),
-                "gastos_financieros": float(gastos_financieros),
-                "resultado_financiero": float(resultado_financiero),
-
-                "ingresos_extraordinarios": float(ingresos_extraordinarios),
-                "gastos_extraordinarios": float(gastos_extraordinarios),
-                "resultado_extraordinario": float(resultado_extraordinario),
-
-                "resultado_antes_impuestos": float(resultado_antes_impuestos),
-                "impuestos_beneficios": float(impuestos_beneficios),
-                "resultado_del_ejercicio": float(resultado_del_ejercicio),
-
-                # Indicadores adicionales
-                "tiene_beneficios": resultado_del_ejercicio > 0,
-                "tiene_perdidas": resultado_del_ejercicio < 0,
-                "interpretacion": self._interpretar_resultado(resultado_del_ejercicio)
-            }
-        }, status=status.HTTP_200_OK)
-
-    def _es_ingreso_explotacion(self, area_nombre, subarea_nombre):
-        """Identifica si es un ingreso de explotación"""
-        ingresos_keywords = [
-            'importe neto de la cifra de negocios',
-            'ventas',
-            'prestaciones de servicios',
-            'otros ingresos de explotación',
-            'subvenciones de explotación',
-            'ingresos accesorios'
-        ]
-
-        # También verificar si está en área de "Ingresos" pero NO es extraordinario
-        if 'ingresos' in area_nombre and 'extraordinario' not in subarea_nombre and 'financier' not in area_nombre:
-            return True
-
-        return any(keyword in area_nombre for keyword in ingresos_keywords)
-
-    def _es_gasto_explotacion(self, area_nombre, subarea_nombre):
-        """Identifica si es un gasto de explotación"""
-        gastos_keywords = [
-            'aprovisionamientos',
-            'gastos de personal',
-            'otros gastos de explotación',
-            'amortización',
-            'amortizaciones'
-        ]
-
-        # También verificar si está en área de "Gastos" pero NO es financiero
-        if 'gastos' in area_nombre and 'financier' not in area_nombre:
-            return True
-
-        return any(keyword in area_nombre for keyword in gastos_keywords)
-
-    def _es_ingreso_financiero(self, area_nombre, subarea_nombre):
-        """Identifica si es un ingreso financiero"""
-        return 'ingresos financieros' in area_nombre
-
-    def _es_gasto_financiero(self, area_nombre, subarea_nombre):
-        """Identifica si es un gasto financiero"""
-        return 'gastos financieros' in area_nombre
-
-    def _es_ingreso_extraordinario(self, area_nombre, subarea_nombre):
-        """Identifica si es un ingreso extraordinario"""
-        return ('extraordinario' in subarea_nombre or
-                'diferencias positivas de cambio' in subarea_nombre)
-
-    def _es_gasto_extraordinario(self, area_nombre, subarea_nombre):
-        """Identifica si es un gasto extraordinario"""
-        return ('extraordinario' in subarea_nombre or
-                'diferencias negativas de cambio' in subarea_nombre)
-
-    def _es_impuesto_beneficios(self, area_nombre, subarea_nombre):
-        """Identifica si son impuestos sobre beneficios"""
-        return 'impuestos sobre beneficios' in area_nombre
-
-    def _interpretar_resultado(self, resultado):
-        """Proporciona una interpretación del resultado"""
-        if resultado > 1000:
-            return f"Beneficio de €{resultado:,.2f}"
-        elif resultado > 0:
-            return f"Beneficio pequeño de €{resultado:,.2f}"
-        elif resultado == 0:
-            return "Equilibrio perfecto (sin beneficios ni pérdidas)"
-        elif resultado > -1000:
-            return f"Pérdida pequeña de €{abs(resultado):,.2f}"
-        else:
-            return f"Pérdida de €{abs(resultado):,.2f}"
-
 
 class IngresosGastosReconocidosView(APIView):
     """
@@ -931,3 +869,208 @@ class IngresosGastosReconocidosView(APIView):
             return f"Ligera pérdida reconocida de €{abs(resultado):,.2f}"
         else:
             return f"Pérdida reconocida de €{abs(resultado):,.2f}"
+
+
+class EstadoResultadosCorregidoView(APIView):
+    """
+    Estado de Resultados con cálculo correcto de pérdidas y ganancias.
+    Calcula los resultados según los principios contables españoles y la estructura del BOE.
+    """
+
+    def get(self, request, *args, **kwargs):
+        # Filtrar áreas de la sección F (Cuenta de Pérdidas y Ganancias)
+        areas_seccion_f = AreaContable.objects.filter(seccion__letra="F").prefetch_related("subareas")
+
+        detalle = []
+        total_debe = Decimal(0)
+        total_haber = Decimal(0)
+
+        # Definir áreas por ID según el BOE y tu estructura
+        INGRESOS_EXPLOTACION_IDS = [94, 95, 96, 98, 102, 103]  # Áreas que generan ingresos
+        GASTOS_EXPLOTACION_IDS = [97, 99, 100, 101, 104]  # Áreas que generan gastos
+        INGRESOS_FINANCIEROS_IDS = [105]  # Ingresos financieros
+        GASTOS_FINANCIEROS_IDS = [106]  # Gastos financieros
+        EXTRAORDINARIOS_IDS = [107, 108, 109]  # Resultados extraordinarios
+        IMPUESTOS_IDS = [110]  # Impuestos sobre beneficios
+
+        # Variables para cálculos de resultados
+        ingresos_explotacion = Decimal(0)
+        gastos_explotacion = Decimal(0)
+        ingresos_financieros = Decimal(0)
+        gastos_financieros = Decimal(0)
+        ingresos_extraordinarios = Decimal(0)
+        gastos_extraordinarios = Decimal(0)
+        impuestos_beneficios = Decimal(0)
+
+        # Iterar por cada área de sección F
+        for area in areas_seccion_f:
+            area_debe = Decimal(0)
+            area_haber = Decimal(0)
+            subarea_detalles = []
+
+            for subarea in area.subareas.all():
+                # Calcular movimientos por códigos positivos y negativos
+                debe_subarea, haber_subarea = self._calcular_movimientos_subarea(subarea)
+
+                # Acumulados generales
+                total_debe += debe_subarea
+                total_haber += haber_subarea
+                area_debe += debe_subarea
+                area_haber += haber_subarea
+
+                # Guardar detalle por subárea
+                subarea_detalles.append({
+                    "nombre": subarea.nombre,
+                    "debe": float(debe_subarea),
+                    "haber": float(haber_subarea)
+                })
+
+            # Clasificar según el ID del área para cálculo de resultados
+            saldo_area = self._calcular_saldo_area(area)
+
+            if area.id in INGRESOS_EXPLOTACION_IDS:
+                ingresos_explotacion += saldo_area
+            elif area.id in GASTOS_EXPLOTACION_IDS:
+                gastos_explotacion += abs(saldo_area)  # Los gastos siempre positivos para el cálculo
+            elif area.id in INGRESOS_FINANCIEROS_IDS:
+                ingresos_financieros += saldo_area
+            elif area.id in GASTOS_FINANCIEROS_IDS:
+                gastos_financieros += abs(saldo_area)
+            elif area.id in EXTRAORDINARIOS_IDS:
+                # Los extraordinarios pueden ser ingresos o gastos
+                if saldo_area >= 0:
+                    ingresos_extraordinarios += saldo_area
+                else:
+                    gastos_extraordinarios += abs(saldo_area)
+            elif area.id in IMPUESTOS_IDS:
+                impuestos_beneficios += abs(saldo_area)
+
+            # Guardar el área con sus subáreas
+            detalle.append({
+                "nombre": area.nombre,
+                "debe": float(area_debe),
+                "haber": float(area_haber),
+                "subareas": subarea_detalles
+            })
+
+        # **CÁLCULO CORRECTO DE RESULTADOS**
+        resultado_explotacion = ingresos_explotacion - gastos_explotacion
+        resultado_financiero = ingresos_financieros - gastos_financieros
+        resultado_extraordinario = ingresos_extraordinarios - gastos_extraordinarios
+        resultado_antes_impuestos = resultado_explotacion + resultado_financiero + resultado_extraordinario
+        resultado_del_ejercicio = resultado_antes_impuestos - impuestos_beneficios
+
+        return Response({
+            "total_estado_resultados": {
+                "debe": float(total_debe),
+                "haber": float(total_haber),
+                "balanceado": total_debe == total_haber
+            },
+            "detalle": detalle,
+            "resultados": {
+                "ingresos_explotacion": float(ingresos_explotacion),
+                "gastos_explotacion": float(gastos_explotacion),
+                "resultado_explotacion": float(resultado_explotacion),
+
+                "ingresos_financieros": float(ingresos_financieros),
+                "gastos_financieros": float(gastos_financieros),
+                "resultado_financiero": float(resultado_financiero),
+
+                "ingresos_extraordinarios": float(ingresos_extraordinarios),
+                "gastos_extraordinarios": float(gastos_extraordinarios),
+                "resultado_extraordinario": float(resultado_extraordinario),
+
+                "resultado_antes_impuestos": float(resultado_antes_impuestos),
+                "impuestos_beneficios": float(impuestos_beneficios),
+                "resultado_del_ejercicio": float(resultado_del_ejercicio),
+
+                # Indicadores adicionales
+                "tiene_beneficios": resultado_del_ejercicio > 0,
+                "tiene_perdidas": resultado_del_ejercicio < 0,
+                "interpretacion": self._interpretar_resultado(resultado_del_ejercicio)
+            }
+        }, status=status.HTTP_200_OK)
+
+    def _calcular_movimientos_subarea(self, subarea):
+        """Calcula los movimientos de una subárea usando códigos positivos y negativos"""
+        debe_total = Decimal(0)
+        haber_total = Decimal(0)
+
+        # Procesar códigos positivos
+        if subarea.codigos_positivos:
+            codigos_pos = [c.strip() for c in subarea.codigos_positivos.split(',') if c.strip()]
+            for codigo in codigos_pos:
+                lineas = LineaFactura.objects.filter(subarea=subarea, cuenta__startswith=codigo)
+                for linea in lineas:
+                    debe_total += linea.debe or Decimal(0)
+                    haber_total += linea.haber or Decimal(0)
+
+        # Procesar códigos negativos (se restan)
+        if subarea.codigos_negativos:
+            codigos_neg = [c.strip() for c in subarea.codigos_negativos.split(',') if c.strip()]
+            for codigo in codigos_neg:
+                lineas = LineaFactura.objects.filter(subarea=subarea, cuenta__startswith=codigo)
+                for linea in lineas:
+                    # Los códigos negativos se restan, pero mantenemos el debe/haber por separado
+                    debe_total += linea.haber or Decimal(0)  # Invertimos para restar
+                    haber_total += linea.debe or Decimal(0)  # Invertimos para restar
+
+        return debe_total, haber_total
+
+    def _calcular_saldo_area(self, area):
+        """Calcula el saldo neto de un área según el tipo de cuenta contable"""
+        saldo_total = Decimal(0)
+
+        for subarea in area.subareas.all():
+            # Códigos positivos: suman al saldo
+            if subarea.codigos_positivos:
+                codigos_pos = [c.strip() for c in subarea.codigos_positivos.split(',') if c.strip()]
+                for codigo in codigos_pos:
+                    lineas = LineaFactura.objects.filter(subarea=subarea, cuenta__startswith=codigo)
+                    for linea in lineas:
+                        debe = linea.debe or Decimal(0)
+                        haber = linea.haber or Decimal(0)
+
+                        # Determinar si es cuenta de ingreso o gasto por el código
+                        if self._es_cuenta_ingreso(codigo):
+                            saldo_total += haber  # Ingresos: solo el haber cuenta
+                        else:
+                            saldo_total += debe  # Gastos: solo el debe cuenta
+
+            # Códigos negativos: restan del saldo
+            if subarea.codigos_negativos:
+                codigos_neg = [c.strip() for c in subarea.codigos_negativos.split(',') if c.strip()]
+                for codigo in codigos_neg:
+                    lineas = LineaFactura.objects.filter(subarea=subarea, cuenta__startswith=codigo)
+                    for linea in lineas:
+                        debe = linea.debe or Decimal(0)
+                        haber = linea.haber or Decimal(0)
+
+                        # Los códigos negativos siempre restan
+                        if self._es_cuenta_ingreso(codigo):
+                            saldo_total -= haber
+                        else:
+                            saldo_total -= debe
+
+        return saldo_total
+
+    def _es_cuenta_ingreso(self, codigo):
+        """Determina si un código de cuenta es de ingreso (7xx) o gasto (6xx)"""
+        try:
+            codigo_num = int(codigo)
+            return 700 <= codigo_num <= 799  # Cuentas de ingresos (grupo 7)
+        except:
+            return codigo.startswith('7')  # Fallback para códigos no numéricos
+
+    def _interpretar_resultado(self, resultado):
+        """Proporciona una interpretación del resultado"""
+        if resultado > 1000:
+            return f"Beneficio de €{resultado:,.2f}"
+        elif resultado > 0:
+            return f"Beneficio pequeño de €{resultado:,.2f}"
+        elif resultado == 0:
+            return "Equilibrio perfecto (sin beneficios ni pérdidas)"
+        elif resultado > -1000:
+            return f"Pérdida pequeña de €{abs(resultado):,.2f}"
+        else:
+            return f"Pérdida de €{abs(resultado):,.2f}"

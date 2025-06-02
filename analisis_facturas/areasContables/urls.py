@@ -1,7 +1,7 @@
 from django.urls import path
 
 from .views.sumViews import SumatoriasBOEView, TotalActivoView, TotalPasivoYPatrimonioView, \
-    EstadoResultadosCorregidoView, IngresosGastosReconocidosView
+    EstadoResultadosCorregidoView, IngresosGastosReconocidosView, TotalActivoCodigosView
 from .views.views import FacturaUploadView, ResumenMensualView, AnalisisDuplicadosView, \
     LineasFacturaSampleListView
 
@@ -17,10 +17,11 @@ urlpatterns = [
     path('sumatorias-boe/', SumatoriasBOEView.as_view(), name='sumatorias-boe'),
     #ejemplo de uso  GET /areasContables/total-activo/
     path('total-activo/', TotalActivoView.as_view(), name='total-activo'),
+    path('total-activo2/', TotalActivoCodigosView.as_view(), name='total_activo_2'),
 
     path('total-patrimonio/', TotalPasivoYPatrimonioView.as_view(), name='total-pasivo'),
     # NUEVAS VISTAS PARA PROBAR
-    path("ganancias/", EstadoResultadosCorregidoView.as_view(), name="estado-resultados-corregido"),
+    path('ganancias/', EstadoResultadosCorregidoView.as_view(), name='estado-resultados'),
     path('ingresos-gastos-reconocidos/', IngresosGastosReconocidosView.as_view(),
          name='ingresos_gastos_reconocidos'),
 
