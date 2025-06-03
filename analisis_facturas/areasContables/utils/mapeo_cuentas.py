@@ -1,10 +1,9 @@
 # utils/mapeo_cuentas.py - Versión Consolidada
 import re
+from datetime import datetime, timedelta,date
 import pandas as pd
 from typing import Dict, List, Any, Tuple, Optional, Union
 from decimal import Decimal, InvalidOperation
-from datetime import datetime, timedelta
-from django.db import models
 from areasContables.models import SubAreaContable, AreaContable, SeccionContable
 
 
@@ -119,87 +118,53 @@ def parse_decimal_mejorado(valor: Any) -> Optional[Decimal]:
 
 
 def parse_fecha_mejorada(fecha_valor: Any) -> Optional[datetime.date]:
-    """
-    Versión mejorada de _parse_fecha() con más formatos.
-    """
     if not fecha_valor or (isinstance(fecha_valor, str) and fecha_valor.strip() == ""):
         return None
 
     try:
-        # Si pandas ya lo convirtió a datetime
-        if hasattr(fecha_valor, 'date'):
+        # Si ya es fecha
+        if isinstance(fecha_valor, (date, datetime, pd.Timestamp)):
             return fecha_valor.date()
 
-        # Si es un objeto datetime de pandas (Timestamp)
-        if str(type(fecha_valor)) == "<class 'pandas._libs.tslibs.timestamps.Timestamp'>":
-            return fecha_valor.date()
-
-        # Si es número (serial de Excel/ODS)
+        # Si es número (serial Excel)
         if isinstance(fecha_valor, (int, float)):
-            if 1 <= fecha_valor <= 100000:  # Rango razonable para fechas Excel
+            if 1 <= fecha_valor <= 100000:
                 excel_epoch = datetime(1900, 1, 1)
-                days = int(fecha_valor) - 2  # -2 por el bug histórico de Excel
-                fecha_calculada = excel_epoch + timedelta(days=days)
-                return fecha_calculada.date()
+                days = int(fecha_valor) - 2
+                return (excel_epoch + timedelta(days=days)).date()
 
-        # Convertir a string y limpiar
+        # Configurar localización a español para meses abreviados
+        import locale
+        try:
+            locale.setlocale(locale.LC_TIME, 'es_ES.UTF-8')  # Linux/Mac
+        except:
+            try:
+                locale.setlocale(locale.LC_TIME, 'Spanish_Spain.1252')  # Windows
+            except:
+                pass
+
+        # Convertir a string
         fecha_str = str(fecha_valor).strip()
-
-        # Manejar valores vacíos o nulos
         if fecha_str.lower() in ['nan', 'nat', 'none', '', 'null']:
             return None
 
-        # Lista ampliada de formatos a probar
         formatos_fecha = [
-            # Formatos con tiempo (más específicos primero)
-            "%Y-%m-%d %H:%M:%S",
-            "%d/%m/%Y %H:%M:%S",
-            "%Y-%m-%dT%H:%M:%S",
-
-            # Formatos solo fecha
-            "%d/%m/%Y",  # 31/12/2024 (formato español)
-            "%Y-%m-%d",  # 2024-12-31 (formato ISO)
-            "%m/%d/%Y",  # 12/31/2024 (formato americano)
-            "%d-%m-%Y",  # 31-12-2024
-            "%Y/%m/%d",  # 2024/12/31
-
-            # Formatos con año corto
-            "%d/%m/%y",
-            "%d-%m-%y",
-            "%y/%m/%d",
-
-            # Otros formatos
-            "%d.%m.%Y",
-            "%d %m %Y",
-            "%Y%m%d",
-            "%d-%b-%Y",
-            "%d %b %Y",
+            "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", "%Y-%m-%dT%H:%M:%S",
+            "%d/%m/%Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%m-%Y", "%Y/%m/%d",
+            "%d/%m/%y", "%d-%m-%y", "%y/%m/%d", "%d.%m.%Y", "%d %m %Y", "%Y%m%d",
+            "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%d %b %y"  # español
         ]
 
-        # Intentar cada formato
         for formato in formatos_fecha:
             try:
-                fecha_parseada = datetime.strptime(fecha_str, formato)
-                return fecha_parseada.date()
+                return datetime.strptime(fecha_str, formato).date()
             except ValueError:
                 continue
 
-        # Si es string numérico, intentar como serial de Excel
-        try:
-            numero_serial = float(fecha_str)
-            if 1 <= numero_serial <= 100000:
-                excel_epoch = datetime(1900, 1, 1)
-                days = int(numero_serial) - 2
-                fecha_calculada = excel_epoch + timedelta(days=days)
-                return fecha_calculada.date()
-        except ValueError:
-            pass
-
-        # Último intento: usar dateutil.parser si está disponible
+        # Último intento: parse flexible
         try:
             from dateutil import parser
-            fecha_parseada = parser.parse(fecha_str, dayfirst=True)
-            return fecha_parseada.date()
+            return parser.parse(fecha_str, dayfirst=True).date()
         except:
             pass
 
@@ -217,7 +182,7 @@ def parse_fecha_mejorada(fecha_valor: Any) -> Optional[datetime.date]:
 # Mapeo consolidado y ampliado de columnas
 MAPEO_COLUMNAS_COMPLETO = {
     'fecha': [
-        'fecha', 'Fecha', 'FECHA', 'Date', 'Fec', 'F'
+        'fecha', 'Fecha', 'FECHA', 'Date','date', 'Fec', 'F'
     ],
     'asiento': [
         'asiento', 'Asiento', 'ASIENTO', 'Asto', 'asto', 'ASTO',
@@ -260,7 +225,14 @@ def mapear_columnas_excel(encabezados: List[str]) -> Dict[str, Dict[str, Any]]:
     Combina funcionalidades de _mapear_columnas() y get_column_value().
     """
     # Convertir encabezados a minúsculas para búsqueda
-    encabezados_lower = [str(h).lower().strip() for h in encabezados]
+    encabezados_limpios = []
+    for h in encabezados:
+        encabezados_limpios = []
+        for h in encabezados:
+            texto = str(h).lower()
+            texto = re.sub(r'\s+', ' ', texto)  # reemplaza múltiples espacios por uno
+            texto = texto.strip()
+            encabezados_limpios.append(texto)
 
     mapeo_encontrado = {}
 
@@ -270,7 +242,7 @@ def mapear_columnas_excel(encabezados: List[str]) -> Dict[str, Dict[str, Any]]:
         mejor_indice = -1
         mejor_score = 0
 
-        for i, encabezado in enumerate(encabezados_lower):
+        for i, encabezado in enumerate(encabezados_limpios):
             for nombre_posible in posibles_nombres:
                 nombre_posible_lower = nombre_posible.lower()
 

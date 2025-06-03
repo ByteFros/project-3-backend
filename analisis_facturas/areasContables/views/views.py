@@ -1,3 +1,5 @@
+from datetime import datetime, date, timedelta
+
 from rest_framework.generics import ListAPIView
 from rest_framework.pagination import PageNumberPagination
 
@@ -93,9 +95,17 @@ class FacturaUploadView(APIView):
             filas = []
 
             for index, row in df.iterrows():
-                valores = [str(val).strip() if pd.notna(val) else "" for val in row.values]
+                valores = []
+                for val in row.values:
+                    if pd.notna(val):
+                        if isinstance(val, (pd.Timestamp, datetime, date)):
+                            valores.append(val)  # mantener como fecha
+                        else:
+                            valores.append(str(val).strip())
+                    else:
+                        valores.append("")
                 # Solo incluir filas que tengan al menos una celda con contenido
-                if any(val.strip() for val in valores):
+                if any(str(val).strip() for val in valores if val is not None):
                     fila_dict = dict(zip(encabezados, valores))
                     filas.append(fila_dict)
 
@@ -149,6 +159,9 @@ class FacturaUploadView(APIView):
             # Detectar tipo de archivo
             tipo_archivo = self._detectar_tipo_archivo(archivo)
             print(f"📄 Tipo de archivo detectado: {tipo_archivo}")
+
+            # ⚠️ BORRAR TODAS LAS LINEAS EXISTENTES ANTES DE PROCESAR LA NUEVA FACTURA
+            LineaFactura.objects.all().delete()
 
             # Leer archivo según su tipo
             if tipo_archivo in ['xls', 'xlsx']:
